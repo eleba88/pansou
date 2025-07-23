@@ -1,9 +1,9 @@
 package service
 
 import (
-	"context" // Added for context.WithTimeout
+	"context"
 	"io/ioutil"
-	"net/http" // Added for http.Client
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -14,7 +14,7 @@ import (
 	"pansou/util"
 	"pansou/util/cache"
 	"pansou/util/pool"
-	"sync" // Added for sync.WaitGroup
+	"sync"
 )
 
 // 优先关键词列表
@@ -68,14 +68,47 @@ func NewSearchService(pluginManager *plugin.PluginManager) *SearchService {
 			}
 		}
 	}
+	
+	// 将主缓存注入到异步插件中
+	injectMainCacheToAsyncPlugins(pluginManager, enhancedTwoLevelCache)
 
 	return &SearchService{
 		pluginManager: pluginManager,
 	}
 }
 
+// injectMainCacheToAsyncPlugins 将主缓存系统注入到异步插件中
+func injectMainCacheToAsyncPlugins(pluginManager *plugin.PluginManager, mainCache *cache.EnhancedTwoLevelCache) {
+	// 如果缓存或插件管理器不可用，直接返回
+	if mainCache == nil || pluginManager == nil {
+		return
+	}
+	
+	// 创建缓存更新函数
+	cacheUpdater := func(key string, data []byte, ttl time.Duration) error {
+		return mainCache.Set(key, data, ttl)
+	}
+	
+	// 获取所有插件
+	plugins := pluginManager.GetPlugins()
+	
+	// 遍历所有插件，找出异步插件
+	for _, p := range plugins {
+		// 检查插件是否实现了SetMainCacheUpdater方法
+		if asyncPlugin, ok := p.(interface{ SetMainCacheUpdater(func(string, []byte, time.Duration) error) }); ok {
+			// 注入缓存更新函数
+			asyncPlugin.SetMainCacheUpdater(cacheUpdater)
+		}
+	}
+}
+
 // Search 执行搜索
-func (s *SearchService) Search(keyword string, channels []string, concurrency int, forceRefresh bool, resultType string, sourceType string, plugins []string) (model.SearchResponse, error) {
+func (s *SearchService) Search(keyword string, channels []string, concurrency int, forceRefresh bool, resultType string, sourceType string, plugins []string, ext map[string]interface{}) (model.SearchResponse, error) {
+	// 确保ext不为nil
+	if ext == nil {
+		ext = make(map[string]interface{})
+	}
+	
 	// 参数预处理
 	// 源类型标准化
 	if sourceType == "" {
@@ -144,6 +177,11 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 			}
 		}
 	}
+	
+	// 如果未指定并发数，使用配置中的默认值
+	if concurrency <= 0 {
+		concurrency = config.AppConfig.DefaultConcurrency
+	}
 
 	// 并行获取TG搜索和插件搜索结果
 	var tgResults []model.SearchResult
@@ -160,7 +198,6 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 			tgResults, tgErr = s.searchTG(keyword, channels, forceRefresh)
 		}()
 	}
-	
 	// 如果需要搜索插件
 	if sourceType == "all" || sourceType == "plugin" {
 		wg.Add(1)
@@ -168,7 +205,7 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 			defer wg.Done()
 			// 对于插件搜索，我们总是希望获取最新的缓存数据
 			// 因此，即使forceRefresh=false，我们也需要确保获取到最新的缓存
-			pluginResults, pluginErr = s.searchPlugins(keyword, plugins, forceRefresh, concurrency)
+			pluginResults, pluginErr = s.searchPlugins(keyword, plugins, forceRefresh, concurrency, ext)
 		}()
 	}
 	
@@ -186,15 +223,12 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 	// 合并结果
 	allResults := mergeSearchResults(tgResults, pluginResults)
 
-	// 过滤结果，确保标题包含搜索关键词
-	filteredResults := filterResultsByKeyword(allResults, keyword)
-
 	// 按照优化后的规则排序结果
-	sortResultsByTimeAndKeywords(filteredResults)
+	sortResultsByTimeAndKeywords(allResults)
 
 	// 过滤结果，只保留有时间的结果或包含优先关键词的结果到Results中
-	filteredForResults := make([]model.SearchResult, 0, len(filteredResults))
-	for _, result := range filteredResults {
+	filteredForResults := make([]model.SearchResult, 0, len(allResults))
+	for _, result := range allResults {
 		// 有时间的结果或包含优先关键词的结果保留在Results中
 		if !result.Datetime.IsZero() || getKeywordPriority(result.Title) > 0 {
 			filteredForResults = append(filteredForResults, result)
@@ -202,7 +236,7 @@ func (s *SearchService) Search(keyword string, channels []string, concurrency in
 	}
 
 	// 合并链接按网盘类型分组（使用所有过滤后的结果）
-	mergedLinks := mergeResultsByType(filteredResults)
+	mergedLinks := mergeResultsByType(allResults)
 
 	// 构建响应
 	var total int
@@ -254,64 +288,6 @@ func filterResponseByType(response model.SearchResponse, resultType string) mode
 			Results:      nil,
 		}
 	}
-}
-
-// 过滤结果，确保标题包含搜索关键词
-func filterResultsByKeyword(results []model.SearchResult, keyword string) []model.SearchResult {
-	// 预估过滤后会保留80%的结果
-	filteredResults := make([]model.SearchResult, 0, len(results)*8/10)
-
-	// 将关键词转为小写，用于不区分大小写的比较
-	lowerKeyword := strings.ToLower(keyword)
-
-	// 将关键词按空格分割，用于支持多关键词搜索
-	keywords := strings.Fields(lowerKeyword)
-
-	for _, result := range results {
-		// 将标题和内容转为小写
-		lowerTitle := strings.ToLower(result.Title)
-		lowerContent := strings.ToLower(result.Content)
-
-		// 检查每个关键词是否在标题或内容中
-		matched := true
-		for _, kw := range keywords {
-			// 如果关键词是"pwd"，特殊处理，只要标题、内容或链接中包含即可
-			if kw == "pwd" {
-				// 检查标题、内容
-				pwdInTitle := strings.Contains(lowerTitle, kw)
-				pwdInContent := strings.Contains(lowerContent, kw)
-
-				// 检查链接中是否包含pwd参数
-				pwdInLinks := false
-				for _, link := range result.Links {
-					if strings.Contains(strings.ToLower(link.URL), "pwd=") {
-						pwdInLinks = true
-						break
-					}
-				}
-
-				// 只要有一个包含pwd，就算匹配
-				if pwdInTitle || pwdInContent || pwdInLinks {
-					continue // 匹配成功，检查下一个关键词
-				} else {
-					matched = false
-					break
-				}
-			} else {
-				// 对于其他关键词，检查是否同时在标题和内容中
-				if !strings.Contains(lowerTitle, kw) && !strings.Contains(lowerContent, kw) {
-					matched = false
-					break
-				}
-			}
-		}
-
-		if matched {
-			filteredResults = append(filteredResults, result)
-		}
-	}
-
-	return filteredResults
 }
 
 // 根据时间和关键词排序结果
@@ -403,7 +379,7 @@ func (s *SearchService) searchChannel(keyword string, channel string) ([]model.S
 	client := util.GetHTTPClient()
 
 	// 创建一个带超时的上下文
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 
 	// 创建请求
@@ -520,6 +496,7 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 			if err == nil && hit {
 				var results []model.SearchResult
 				if err := enhancedTwoLevelCache.GetSerializer().Deserialize(data, &results); err == nil {
+					// 直接返回缓存数据，不检查新鲜度
 					return results, nil
 				}
 			}
@@ -529,13 +506,14 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 			if err == nil && hit {
 				var results []model.SearchResult
 				if err := cache.DeserializeWithPool(data, &results); err == nil {
+					// 直接返回缓存数据，不检查新鲜度
 					return results, nil
 				}
 			}
 		}
 	}
 	
-	// 缓存未命中，执行实际搜索
+	// 缓存未命中或强制刷新，执行实际搜索
 	var results []model.SearchResult
 	
 	// 使用工作池并行搜索多个频道
@@ -589,7 +567,12 @@ func (s *SearchService) searchTG(keyword string, channels []string, forceRefresh
 }
 
 // searchPlugins 搜索插件
-func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRefresh bool, concurrency int) ([]model.SearchResult, error) {
+func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRefresh bool, concurrency int, ext map[string]interface{}) ([]model.SearchResult, error) {
+	// 确保ext不为nil
+	if ext == nil {
+		ext = make(map[string]interface{})
+	}
+	
 	// 生成缓存键
 	cacheKey := cache.GeneratePluginCacheKey(keyword, plugins)
 	
@@ -601,28 +584,16 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 		
 		// 优先使用增强版缓存
 		if enhancedTwoLevelCache != nil {
+			
+			// 使用Get方法，它会检查磁盘缓存是否有更新
+			// 如果磁盘缓存比内存缓存更新，会自动更新内存缓存并返回最新数据
 			data, hit, err = enhancedTwoLevelCache.Get(cacheKey)
 			
 			if err == nil && hit {
 				var results []model.SearchResult
 				if err := enhancedTwoLevelCache.GetSerializer().Deserialize(data, &results); err == nil {
-					// 确保缓存数据是最新的
-					// 如果缓存数据是最近更新的（例如在过去30秒内），则直接返回
-					// 否则，我们将重新执行搜索以获取最新数据
-					if len(results) > 0 {
-						// 获取当前时间
-						now := time.Now()
-						// 检查缓存数据是否是最近更新的
-						// 这里我们假设如果缓存数据中有结果的时间戳在过去30秒内，则认为是最新的
-						for _, result := range results {
-							if !result.Datetime.IsZero() && now.Sub(result.Datetime) < 30*time.Second {
-								return results, nil
-							}
-						}
-					} else {
-						// 如果缓存中没有数据，直接返回空结果
-						return results, nil
-					}
+					// 返回缓存数据
+					return results, nil
 				}
 			}
 		} else if twoLevelCache != nil {
@@ -631,29 +602,14 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 			if err == nil && hit {
 				var results []model.SearchResult
 				if err := cache.DeserializeWithPool(data, &results); err == nil {
-					// 确保缓存数据是最新的
-					// 如果缓存数据是最近更新的（例如在过去30秒内），则直接返回
-					// 否则，我们将重新执行搜索以获取最新数据
-					if len(results) > 0 {
-						// 获取当前时间
-						now := time.Now()
-						// 检查缓存数据是否是最近更新的
-						// 这里我们假设如果缓存数据中有结果的时间戳在过去30秒内，则认为是最新的
-						for _, result := range results {
-							if !result.Datetime.IsZero() && now.Sub(result.Datetime) < 30*time.Second {
-								return results, nil
-							}
-						}
-					} else {
-						// 如果缓存中没有数据，直接返回空结果
-						return results, nil
-					}
+					// 返回缓存数据
+					return results, nil
 				}
 			}
 		}
 	}
 	
-	// 缓存未命中或缓存数据不是最新的，执行实际搜索
+	// 缓存未命中或强制刷新，执行实际搜索
 	// 获取所有可用插件
 	var availablePlugins []plugin.SearchPlugin
 	if s.pluginManager != nil {
@@ -694,10 +650,8 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 	
 	// 控制并发数
 	if concurrency <= 0 {
-		concurrency = len(availablePlugins) + 10
-		if concurrency < 1 {
-			concurrency = 1
-		}
+		// 使用配置中的默认值
+		concurrency = config.AppConfig.DefaultConcurrency
 	}
 	
 	// 使用工作池执行并行搜索
@@ -705,11 +659,32 @@ func (s *SearchService) searchPlugins(keyword string, plugins []string, forceRef
 	for _, p := range availablePlugins {
 		plugin := p // 创建副本，避免闭包问题
 		tasks = append(tasks, func() interface{} {
-			results, err := plugin.Search(keyword)
-			if err != nil {
-				return nil
+			// 检查插件是否为异步插件
+			if asyncPlugin, ok := plugin.(interface {
+				AsyncSearch(keyword string, searchFunc func(*http.Client, string, map[string]interface{}) ([]model.SearchResult, error), mainCacheKey string, ext map[string]interface{}) ([]model.SearchResult, error)
+				SetMainCacheKey(string)
+			}); ok {
+				// 先设置主缓存键
+				asyncPlugin.SetMainCacheKey(cacheKey)
+				
+				// 是异步插件，调用AsyncSearch方法并传递主缓存键和ext参数
+				results, err := asyncPlugin.AsyncSearch(keyword, func(client *http.Client, kw string, extParams map[string]interface{}) ([]model.SearchResult, error) {
+					// 这里使用插件的Search方法作为搜索函数，传递ext参数
+					return plugin.Search(kw, extParams)
+				}, cacheKey, ext)
+				
+				if err != nil {
+					return nil
+				}
+				return results
+			} else {
+				// 不是异步插件，直接调用Search方法，传递ext参数
+				results, err := plugin.Search(keyword, ext)
+				if err != nil {
+					return nil
+				}
+				return results
 			}
-			return results
 		})
 	}
 	

@@ -140,6 +140,25 @@ func SearchHandler(c *gin.Context) {
             }
         }
 
+        // 处理ext参数，JSON格式
+        var ext map[string]interface{}
+        extStr := c.Query("ext")
+        if extStr != "" && extStr != " " {
+            // 处理特殊情况：ext={}
+            if extStr == "{}" {
+                ext = make(map[string]interface{})
+            } else {
+                if err := jsonutil.Unmarshal([]byte(extStr), &ext); err != nil {
+                    c.JSON(http.StatusBadRequest, model.NewErrorResponse(400, "无效的ext参数格式: "+err.Error()))
+                    return
+                }
+            }
+        }
+        // 确保ext不为nil
+        if ext == nil {
+            ext = make(map[string]interface{})
+        }
+
         req = model.SearchRequest{
             Keyword:      keyword,
             Channels:     channels,
@@ -148,6 +167,7 @@ func SearchHandler(c *gin.Context) {
             ResultType:   resultType,
             SourceType:   sourceType,
             Plugins:      plugins,
+            Ext:          ext,
         }
     } else {
         // POST方式：从请求体获取
@@ -189,7 +209,7 @@ func SearchHandler(c *gin.Context) {
     }
     
     // 执行搜索
-    result, err := searchService.Search(req.Keyword, req.Channels, req.Concurrency, req.ForceRefresh, req.ResultType, req.SourceType, req.Plugins)
+    result, err := searchService.Search(req.Keyword, req.Channels, req.Concurrency, req.ForceRefresh, req.ResultType, req.SourceType, req.Plugins, req.Ext)
     
     if err != nil {
         response := model.NewErrorResponse(500, "搜索失败: "+err.Error())
@@ -299,6 +319,7 @@ func LoggerMiddleware() gin.HandlerFunc {
 | res | string | 否 | 结果类型：all(返回所有结果)、results(仅返回results)、merge(仅返回merged_by_type)，默认为merge |
 | src | string | 否 | 数据来源类型：all(默认，全部来源)、tg(仅Telegram)、plugin(仅插件) |
 | plugins | string[] | 否 | 指定搜索的插件列表，不指定则搜索全部插件 |
+| ext | object | 否 | 扩展参数，用于传递给插件的自定义参数，如{"title_en":"English Title", "is_all":true} |
 
 #### GET请求参数
 
@@ -311,6 +332,7 @@ func LoggerMiddleware() gin.HandlerFunc {
 | res | string | 否 | 结果类型：all(返回所有结果)、results(仅返回results)、merge(仅返回merged_by_type)，默认为merge |
 | src | string | 否 | 数据来源类型：all(默认，全部来源)、tg(仅Telegram)、plugin(仅插件) |
 | plugins | string | 否 | 指定搜索的插件列表，使用英文逗号分隔多个插件名，不指定则搜索全部插件 |
+| ext | string | 否 | JSON格式的扩展参数，用于传递给插件的自定义参数，如{"title_en":"English Title", "is_all":true} |
 
 #### 成功响应
 
@@ -378,14 +400,83 @@ func LoggerMiddleware() gin.HandlerFunc {
 {
   "status": "ok",
   "plugins_enabled": true,
-  "plugin_count": 6
+  "plugin_count": 6,
+  "plugins": ["pansearch", "panta", "qupansou", "hunhepan", "jikepan", "pan666"],
+  "channels": ["tgsearchers2", "SharePanBaidu"]
 }
 ```
 
-## 7. 性能优化措施
+## 7. 参数处理优化
+
+### 7.1 GET请求参数处理
+
+```go
+// 处理plugins参数，支持逗号分隔
+var plugins []string
+// 检查请求中是否存在plugins参数
+if c.Request.URL.Query().Has("plugins") {
+    pluginsStr := c.Query("plugins")
+    // 判断参数是否非空
+    if pluginsStr != "" && pluginsStr != " " {
+        parts := strings.Split(pluginsStr, ",")
+        for _, part := range parts {
+            trimmed := strings.TrimSpace(part)
+            if trimmed != "" {
+                plugins = append(plugins, trimmed)
+            }
+        }
+    }
+} else {
+    // 如果请求中不存在plugins参数，设置为nil
+    plugins = nil
+}
+```
+
+### 7.2 扩展参数处理
+
+```go
+// 处理ext参数，JSON格式
+var ext map[string]interface{}
+extStr := c.Query("ext")
+if extStr != "" && extStr != " " {
+    // 处理特殊情况：ext={}
+    if extStr == "{}" {
+        ext = make(map[string]interface{})
+    } else {
+        if err := jsonutil.Unmarshal([]byte(extStr), &ext); err != nil {
+            c.JSON(http.StatusBadRequest, model.NewErrorResponse(400, "无效的ext参数格式: "+err.Error()))
+            return
+        }
+    }
+}
+// 确保ext不为nil
+if ext == nil {
+    ext = make(map[string]interface{})
+}
+```
+
+### 7.3 参数互斥与规范化处理
+
+```go
+// 参数互斥逻辑：当src=tg时忽略plugins参数，当src=plugin时忽略channels参数
+if req.SourceType == "tg" {
+    req.Plugins = nil // 忽略plugins参数
+} else if req.SourceType == "plugin" {
+    req.Channels = nil // 忽略channels参数
+} else if req.SourceType == "all" {
+    // 对于all类型，如果plugins为空或不存在，统一设为nil
+    if req.Plugins == nil || len(req.Plugins) == 0 {
+        req.Plugins = nil
+    }
+}
+```
+
+## 8. 性能优化措施
 
 1. **高效参数处理**：对GET请求参数进行高效处理，避免不必要的字符串操作
 2. **高性能JSON库**：使用sonic高性能JSON库处理请求和响应
 3. **响应压缩**：通过GzipMiddleware实现响应压缩，减少传输数据量
 4. **避免内存分配**：合理使用预分配和对象池，减少内存分配和GC压力
 5. **直接写入响应体**：使用`c.Data`直接写入响应体，避免中间转换
+6. **精确参数检查**：使用`c.Request.URL.Query().Has()`检查参数是否存在，避免不必要的处理
+7. **参数统一处理**：对相同语义的不同形式参数进行统一处理，确保缓存一致性
